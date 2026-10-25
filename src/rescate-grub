@@ -1,0 +1,102 @@
+#!/bin/bash
+# rescate-grub - escribe /boot/grub2/custom.cfg con las entradas de emergencia:
+#   Fedora (modo seguro), Fedora (modo texto), Rescate, Rescate (copia), Memtest86+
+# Se ejecuta solo al arrancar y tras cada actualización de Fedora.
+# Uso: rescate-grub [DIRECTORIO_BOOT]   (por defecto /boot)
+set -u
+B=${1:-/boot}
+E=$(ls "$B"/loader/entries/ostree-*.conf 2>/dev/null | sort -t- -k2 -n | tail -1)
+BOOTDEV=$(findmnt -no SOURCE --target "$B")
+BOOTUUID=$(blkid -s UUID -o value "$BOOTDEV")
+[ -n "$BOOTUUID" ] || { echo "rescate-grub: no se encontró la partición /boot" >&2; exit 1; }
+
+RO=0
+if findmnt -no OPTIONS --target "$B" | grep -qw ro; then mount -o remount,rw "$B" && RO=1; fi
+trap '[ $RO = 1 ] && mount -o remount,ro "$B"' EXIT
+
+SAFE="nomodeset modprobe.blacklist=nvidia,nvidia_drm,nvidia_modeset,nvidia_uvm,nouveau rd.driver.blacklist=nvidia,nouveau"
+LIVE="rd.live.dir=/rescate rd.live.squashimg=rootfs.img rd.live.ram=1 rd.live.overlay.overlayfs=1 selinux=0 modprobe.blacklist=nvidia,nvidia_drm,nvidia_modeset rd.driver.blacklist=nvidia vconsole.keymap=latam vconsole.font=eurlatgr quiet loglevel=3 audit=0"
+
+ROOTUUID=
+generate() {
+  echo "# Rescate - generado por rescate-grub el $(date '+%F %T'). Se regenera solo; no editar."
+  echo "set timeout=5"
+  echo "set timeout_style=menu"
+  if [ -n "$E" ]; then
+    K=$(awk '$1=="linux"{print $2}' "$E"); I=$(awk '$1=="initrd"{print $2}' "$E")
+    O=$(sed -n 's/^options //p' "$E")
+    ROOTUUID=$(grep -o 'root=UUID=[^ ]*' <<<"$O" | cut -d= -f3)
+    O=$(tr ' ' '\n' <<<"$O" | grep -vE '^(rhgb|quiet|nomodeset|rd\.driver\.blacklist=.*|modprobe\.blacklist=.*|nvidia-drm\..*|systemd\.unit=.*)$' | paste -sd' ')
+    V=$(sed -n 's/^title //p' "$E" | sed 's/ (ostree:[0-9]*)//')
+    for mode in seguro texto; do
+      extra="$SAFE"; label="Fedora - modo seguro"
+      [ $mode = texto ] && { extra+=" systemd.unit=multi-user.target"; label="Fedora - modo seguro (solo texto)"; }
+      cat <<X
+menuentry '$label' --id rescate-$mode {
+  insmod part_gpt
+  insmod ext2
+  search --no-floppy --fs-uuid --set=root $BOOTUUID
+  echo 'Arrancando $V en modo seguro...'
+  linux $K $O $extra
+  initrd $I
+}
+X
+    done
+  fi
+  if [ -f "$B/rescate/vmlinuz" ]; then
+    cat <<X
+menuentry 'Rescate - reparar Fedora' --id rescate {
+  insmod part_gpt
+  insmod ext2
+  search --no-floppy --fs-uuid --set=root $BOOTUUID
+  echo 'Cargando Rescate en memoria (unos segundos)...'
+  linux /rescate/vmlinuz root=live:UUID=$BOOTUUID $LIVE
+  initrd /rescate/initramfs.img
+}
+X
+  fi
+  if [ -n "$ROOTUUID" ]; then
+    cat <<X
+menuentry 'Rescate - copia de emergencia (si la anterior falla)' --id rescate-copia {
+  insmod part_gpt
+  insmod btrfs
+  search --no-floppy --fs-uuid --set=root $ROOTUUID
+  if [ -f /rescate/vmlinuz ]; then
+    echo 'Cargando la copia de emergencia de Rescate...'
+    linux /rescate/vmlinuz root=live:UUID=$ROOTUUID $LIVE
+    initrd /rescate/initramfs.img
+  else
+    echo 'No hay copia de emergencia de Rescate.'; sleep 5
+  fi
+}
+X
+  fi
+  if [ -f "$B/rescate/memtest.efi" ]; then
+    cat <<X
+if [ "\$grub_platform" = "efi" ]; then
+  menuentry 'Memtest86+ - prueba completa de la RAM' --id rescate-memtest {
+    search --no-floppy --fs-uuid --set=root $BOOTUUID
+    chainloader /rescate/memtest.efi
+  }
+fi
+X
+  fi
+  cat <<'X'
+menuentry 'Reiniciar' --id rescate-reiniciar { reboot }
+menuentry 'Apagar' --id rescate-apagar { halt }
+X
+}
+# Sin archivos temporales (SELinux) y sin pisar nunca un custom.cfg bueno
+# con uno vacío o a medias.
+NEW=$(generate) || exit 1
+grep -q "menuentry 'Reiniciar'" <<<"$NEW" || { echo "rescate-grub: contenido incompleto, no se toca custom.cfg" >&2; exit 1; }
+C="$B/grub2/custom.cfg"
+mkdir -p "$B/grub2"
+if [ "$(sed 1d "$C" 2>/dev/null)" != "$(sed 1d <<<"$NEW")" ]; then
+  printf '%s\n' "$NEW" > "$C.nuevo" && [ -s "$C.nuevo" ] && mv -f "$C.nuevo" "$C" || { rm -f "$C.nuevo"; echo "rescate-grub: no se pudo escribir $C" >&2; exit 1; }
+  command -v restorecon >/dev/null && restorecon "$C" 2>/dev/null
+  sync -f "$C" 2>/dev/null
+fi
+# Menú visible siempre (para poder elegir Rescate en una emergencia)
+grub2-editenv "$B/grub2/grubenv" unset menu_auto_hide 2>/dev/null || true
+exit 0

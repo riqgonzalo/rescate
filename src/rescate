@@ -1,0 +1,331 @@
+#!/bin/bash
+# Rescate — menú de reparación de Fedora Kinoite
+# Uso: rescate                → menú
+#      rescate auto           → reparación automática sin preguntas
+#      rescate reinstalar-completo DISCO USUARIO CLAVE [EQUIPO]   (borra todo)
+. /usr/local/sbin/rescate-lib.sh
+export NEWT_COLORS='root=white,blue window=black,lightgray title=blue,lightgray button=white,blue actbutton=white,red'
+
+pause() { echo; read -rp "Pulsa Enter para volver al menú..." _; }
+net_status() {
+  if curl -s -m 4 -o /dev/null https://fedoraproject.org/; then echo "Internet: CONECTADO"; else echo "Internet: sin conexión"; fi
+}
+
+# ------------------------------------------------------------ Internet
+menu_internet() {
+  while true; do
+    local c
+    c=$(whiptail --title "Rescate · Internet" --menu "$(net_status)\n\nEl cable de red se conecta solo." 18 74 6 \
+      1 "Conectar a Wi-Fi" \
+      2 "Internet por Bluetooth (desde el teléfono)" \
+      3 "Internet por USB (teléfono en modo módem)" \
+      4 "Ver estado de la red" \
+      5 "Volver" 3>&1 1>&2 2>&3) || return
+    case $c in
+      1) nmcli radio wifi on; rfkill unblock all; nmtui-connect ;;
+      2) bt_pan ;;
+      3) msg "Conecta el teléfono por USB y activa 'Módem USB' / 'Anclaje USB' en él.\n\nPulsa Aceptar cuando esté activado."; sleep 3
+         nmcli device | grep -E 'ethernet' ; nmcli device connect "$(nmcli -t -f DEVICE,TYPE device | awk -F: '$2=="ethernet"{print $1}' | tail -1)" >/dev/null 2>&1
+         msg "$(net_status)" ;;
+      4) clear; nmcli device status; echo; ip -br addr; echo; net_status; pause ;;
+      5) return ;;
+    esac
+  done
+}
+
+# ------------------------------------------------------------ Bluetooth
+bt_ready() {
+  rfkill unblock bluetooth 2>/dev/null
+  systemctl start bluetooth 2>/dev/null; sleep 1
+  bluetoothctl power on >/dev/null 2>&1
+}
+bt_pick() {  # elige un dispositivo; imprime su MAC
+  bt_ready
+  whiptail --title "Rescate · Bluetooth" --infobox "Buscando dispositivos (12 s)...\nPon el dispositivo en modo emparejamiento." 8 60
+  bluetoothctl --timeout 12 scan on >/dev/null 2>&1
+  local items=() mac name
+  while read -r _ mac name; do items+=("$mac" "${name:-$mac}"); done < <(bluetoothctl devices)
+  [ ${#items[@]} -gt 0 ] || { msg "No se encontró ningún dispositivo."; return 1; }
+  whiptail --title "Rescate · Bluetooth" --menu "Elige el dispositivo:" 18 70 8 "${items[@]}" 3>&1 1>&2 2>&3
+}
+bt_connect() {
+  local mac; mac=$(bt_pick) || return
+  whiptail --title "Rescate · Bluetooth" --infobox "Emparejando $mac...\nSi aparece un código, acéptalo en el dispositivo." 8 60
+  bluetoothctl --agent NoInputNoOutput pair "$mac" >>"$LOG" 2>&1
+  bluetoothctl trust "$mac" >>"$LOG" 2>&1
+  if bluetoothctl connect "$mac" >>"$LOG" 2>&1; then msg "Conectado a $mac."; else msg "Emparejado. Si es un teléfono, usa 'Internet por Bluetooth'."; fi
+}
+bt_pan() {
+  msg "En el teléfono activa 'Compartir internet por Bluetooth' (Anclaje Bluetooth) y deja visible el Bluetooth."
+  local mac; mac=$(bt_pick) || return
+  bluetoothctl --agent NoInputNoOutput pair "$mac" >>"$LOG" 2>&1; bluetoothctl trust "$mac" >>"$LOG" 2>&1
+  nmcli connection delete rescate-bt >/dev/null 2>&1
+  nmcli connection add type bluetooth con-name rescate-bt bluetooth.bdaddr "$mac" bluetooth.type panu >>"$LOG" 2>&1
+  if nmcli connection up rescate-bt >>"$LOG" 2>&1; then msg "Internet por Bluetooth conectado.\n\n$(net_status)"
+  else msg "No se pudo conectar. Revisa que el teléfono tenga activado el anclaje por Bluetooth."; fi
+}
+menu_bluetooth() {
+  while true; do
+    local c
+    c=$(whiptail --title "Rescate · Bluetooth" --menu "Teclados, ratones, auriculares o teléfono" 16 70 5 \
+      1 "Conectar un dispositivo (teclado, ratón...)" \
+      2 "Internet desde el teléfono por Bluetooth" \
+      3 "Ver dispositivos conectados" \
+      4 "Volver" 3>&1 1>&2 2>&3) || return
+    case $c in
+      1) bt_connect ;;
+      2) bt_pan ;;
+      3) clear; bt_ready; bluetoothctl devices Connected; pause ;;
+      4) return ;;
+    esac
+  done
+}
+
+# ------------------------------------------------------------ Arranque
+menu_boot() {
+  while true; do
+    local c
+    c=$(whiptail --title "Rescate · Arranque" --menu "Reparaciones del arranque" 18 76 8 \
+      1 "Reparar TODO el arranque (recomendado)" \
+      2 "Restaurar cargadores EFI (shim / GRUB)" \
+      3 "Regenerar configuración de GRUB" \
+      4 "Reparar entradas de arranque de Fedora" \
+      5 "Reparar menú de arranque UEFI del equipo" \
+      6 "Reparar /etc/fstab (discos que impiden arrancar)" \
+      7 "Volver" 3>&1 1>&2 2>&3) || return
+    FIXES=(); WARNINGS=(); detect || { msg "No se encontró Fedora."; continue; }
+    case $c in
+      1) repair_boot_entries; repair_efi_files; repair_grub_config; repair_uefi_entries; repair_fstab ;;
+      2) repair_efi_files ;;
+      3) repair_grub_config ;;
+      4) repair_boot_entries ;;
+      5) repair_uefi_entries ;;
+      6) repair_fstab ;;
+      7) return ;;
+    esac
+    fix_boot_labels; release_all; show_result
+  done
+}
+
+show_result() {
+  local s=""
+  [ ${#FIXES[@]} -gt 0 ] && { s+="Se arregló:\n"; for f in "${FIXES[@]}"; do s+=" • $f\n"; done; }
+  [ ${#WARNINGS[@]} -gt 0 ] && { s+="\nAvisos:\n"; for f in "${WARNINGS[@]}"; do s+=" • $f\n"; done; }
+  [ -z "$s" ] && s="Todo está correcto. No hubo nada que reparar."
+  msg "$s"
+}
+
+# ------------------------------------------------------------ NVIDIA
+menu_nvidia() {
+  while true; do
+    local c
+    c=$(whiptail --title "Rescate · NVIDIA" --menu "Pantalla negra o gráficos rotos" 18 78 7 \
+      1 "Revisar y reparar NVIDIA automáticamente" \
+      2 "Arrancar solo con la gráfica Intel (desactivar NVIDIA)" \
+      3 "Volver a usar NVIDIA (configuración recomendada)" \
+      4 "Reconstruir el controlador NVIDIA al iniciar (requiere internet)" \
+      5 "Volver a una versión donde NVIDIA funcionaba" \
+      6 "Volver" 3>&1 1>&2 2>&3) || return
+    FIXES=(); WARNINGS=(); detect && mount_sysroot || { msg "No se encontró Fedora."; continue; }
+    case $c in
+      1) check_nvidia ;;
+      2) entry_add $INTEL_ONLY_KARGS; entry_del nomodeset; fixd "NVIDIA desactivada: se usará la gráfica Intel" ;;
+      3) entry_del $INTEL_ONLY_KARGS nomodeset; entry_add $NVIDIA_KARGS; fixd "Configuración NVIDIA recomendada aplicada" ;;
+      4) schedule_nvidia_rebuild ;;
+      5) rollback_menu ;;
+      6) release_all; return ;;
+    esac
+    release_all; show_result
+  done
+}
+
+# ------------------------------------------------------------ Discos
+menu_disks() {
+  while true; do
+    local c
+    c=$(whiptail --title "Rescate · Discos" --menu "Revisión de discos y espacio" 17 74 6 \
+      1 "Revisar y reparar sistemas de archivos" \
+      2 "Verificar datos de btrfs (scrub, tarda)" \
+      3 "Liberar espacio (versiones viejas, /boot lleno)" \
+      4 "Salud del disco (SMART)" \
+      5 "Volver" 3>&1 1>&2 2>&3) || return
+    FIXES=(); WARNINGS=(); detect || { msg "No se encontró Fedora."; continue; }
+    case $c in
+      1) clear; check_filesystems ;;
+      2) clear; scrub_btrfs ;;
+      3) check_space; mount_sysroot && run ostree admin --sysroot="$SYSROOT" cleanup ;;
+      4) clear; smartctl -a "$DISK" | less ;;
+      5) return ;;
+    esac
+    release_all; show_result
+  done
+}
+
+# ------------------------------------------------------------ Sistema
+menu_system() {
+  while true; do
+    local c
+    c=$(whiptail --title "Rescate · Sistema" --menu "Otras reparaciones" 20 78 9 \
+      1 "Cambiar o desbloquear la contraseña de un usuario" \
+      2 "Reparar permisos SELinux (no deja iniciar sesión)" \
+      3 "Restablecer la configuración del sistema de fábrica" \
+      4 "Ver errores del último arranque fallido" \
+      5 "Arrancar una vez en modo texto (sin escritorio)" \
+      6 "Copiar mis archivos a un USB" \
+      7 "Terminal dentro de mi Fedora (avanzado)" \
+      8 "Terminal del Rescate (avanzado)" \
+      9 "Volver" 3>&1 1>&2 2>&3) || return
+    FIXES=(); WARNINGS=(); detect || { msg "No se encontró Fedora."; continue; }
+    case $c in
+      1) reset_password ;;
+      2) repair_selinux ;;
+      3) ask "Se restablecerá /etc a los valores de fábrica.\nSe conservan usuarios, contraseñas, Wi-Fi guardadas y discos.\n\n¿Continuar?" && mount_sysroot && reset_etc_to_defaults "$DEP" ;;
+      4) clear; last_boot_errors | less ;;
+      5) safe_mode_once texto ;;
+      6) backup_files ;;
+      7) prepare_chroot && { clear; echo "Estás dentro de tu Fedora. Escribe 'exit' para salir."; chroot "$DEP" /bin/bash -l; } ;;
+      8) clear; echo "Escribe 'exit' para volver al menú."; bash -l ;;
+      9) release_all; return ;;
+    esac
+    release_all; show_result
+  done
+}
+
+backup_files() {
+  prepare_chroot || return
+  local items=() dev size label
+  while read -r dev size label; do items+=("$dev" "$size ${label:-sin nombre}"); done < <(lsblk -lnpo NAME,SIZE,LABEL,TRAN,TYPE | awk '$NF=="part" && $(NF-1)!="nvme" {print $1, $2, $3}' | grep -v "^$DISK")
+  [ ${#items[@]} -gt 0 ] || { msg "Conecta un USB o tarjeta SD y vuelve a intentarlo."; return; }
+  local d; d=$(whiptail --title "Rescate" --menu "¿A dónde copiar?" 15 60 6 "${items[@]}" 3>&1 1>&2 2>&3) || return
+  mkdir -p /mnt/usb; mount "$d" /mnt/usb || { msg "No se pudo montar $d"; return; }
+  local dest="/mnt/usb/Copia-Rescate-$(date +%Y%m%d-%H%M)"
+  clear; echo "Copiando /home a $dest (puede tardar)..."
+  rsync -rlt --info=progress2 --exclude='.cache' "$DEP/var/home/" "$dest/" 2>>"$LOG"
+  sync; umount /mnt/usb
+  msg "Copia terminada en $(basename "$dest")."
+}
+
+# ------------------------------------------------------------ Reinstalar / actualizar
+menu_reinstall() {
+  local c
+  c=$(whiptail --title "Rescate · Reinstalar" --menu "Necesita internet." 17 78 5 \
+    1 "Actualizar Fedora a la última versión (conserva todo)" \
+    2 "Reinstalar Fedora Kinoite conservando mis archivos" \
+    3 "Reinstalar conservando archivos + configuración de fábrica" \
+    4 "Reinstalar desde CERO (borra todo el disco)" \
+    5 "Volver" 3>&1 1>&2 2>&3) || return
+  FIXES=(); WARNINGS=()
+  case $c in
+    1|2) reinstall_keep no ;;
+    3) reinstall_keep yes ;;
+    4) full_reinstall_dialog ;;
+  esac
+}
+
+full_reinstall_dialog() {
+  local items=() dev size model
+  while read -r dev size model; do items+=("$dev" "$size $model"); done < <(lsblk -dnpo NAME,SIZE,MODEL,TYPE | awk '$NF=="disk"{ $NF=""; print }' | grep -v zram)
+  local disk; disk=$(whiptail --title "Rescate" --menu "¿En qué disco instalar?\n(SE BORRARÁ COMPLETO)" 16 70 6 "${items[@]}" 3>&1 1>&2 2>&3) || return
+  local user host p1 p2 full
+  user=$(input "Nombre de usuario (minúsculas, sin espacios):" "${SUDO_USER:-usuario}") || return
+  full=$(input "Nombre completo:" "$user") || return
+  host=$(input "Nombre del equipo:" "fedora") || return
+  p1=$(secret "Contraseña para $user:") || return
+  p2=$(secret "Repite la contraseña:") || return
+  [ "$p1" = "$p2" ] && [ -n "$p1" ] || { msg "Las contraseñas no coinciden."; return; }
+  local confirm; confirm=$(input "Se BORRARÁ TODO en $disk, incluidos tus archivos.\n\nEscribe BORRAR para continuar:") || return
+  [ "$confirm" = BORRAR ] || { msg "Cancelado."; return; }
+  clear; reinstall_full "$disk" "$user" "$p1" "$host" "$full"
+}
+
+# ------------------------------------------------------------ Modo seguro
+menu_safe() {
+  local c
+  c=$(whiptail --title "Rescate · Modo seguro" --menu "Arranca tu Fedora UNA vez con opciones mínimas.\nEl arranque siguiente vuelve a ser normal.\n\nTambién está siempre en el menú de GRUB." 18 76 4 \
+    1 "Modo seguro con escritorio (sin NVIDIA, gráficos básicos)" \
+    2 "Modo seguro en texto (sin escritorio)" \
+    3 "Volver" 3>&1 1>&2 2>&3) || return
+  FIXES=(); WARNINGS=(); detect || { msg "No se encontró Fedora."; return; }
+  case $c in
+    1) safe_mode_once grafico ;;
+    2) safe_mode_once texto ;;
+    *) return ;;
+  esac
+  release_all; show_result
+  ask "¿Reiniciar ahora en modo seguro?" && systemctl reboot
+}
+
+# ------------------------------------------------------------ Hardware
+menu_hardware() {
+  while true; do
+    local c
+    c=$(whiptail --title "Rescate · Pruebas de hardware" --menu "Para descartar fallos físicos del equipo" 20 78 9 \
+      1 "Prueba rápida de todo (unos 8 minutos)" \
+      2 "Memoria RAM (memtester)" \
+      3 "Disco: auto-prueba SMART corta" \
+      4 "Disco: auto-prueba SMART larga (tarda mucho)" \
+      5 "Disco: leer toda la superficie (sectores dañados)" \
+      6 "Memoria de video NVIDIA (VRAM)" \
+      7 "Procesador y temperatura (estrés 5 min)" \
+      8 "Batería y cargador" \
+      9 "Volver" 3>&1 1>&2 2>&3) || return
+    clear; HWFAIL=(); [ "$c" != 1 ] && : > "$REPORT"; detect >/dev/null 2>&1
+    case $c in
+      1) test_quick_all ;;
+      2) local g; g=$(input "¿Cuántos GB probar? (vacío = toda la libre)" "") ; clear; test_ram $g ;;
+      3) test_disk rapida ;;
+      4) test_disk larga ;;
+      5) test_disk superficie ;;
+      6) test_vram ;;
+      7) test_cpu 300 ;;
+      8) test_battery ;;
+      9) return ;;
+    esac
+    whiptail --title "Rescate · Resultado" --textbox "$REPORT" 22 78 --scrolltext
+  done
+}
+
+# ------------------------------------------------------------ principal
+main_menu() {
+  while true; do
+    local c
+    c=$(whiptail --title "Rescate" --menu "$(net_status)\n\nElige una opción. Si no sabes cuál, usa la 1." 25 78 15 \
+      1 "Reparación automática (recomendado)" \
+      2 "Conectar a internet (Wi-Fi, cable, teléfono)" \
+      3 "Bluetooth" \
+      4 "Reparar el arranque" \
+      5 "Entrar en modo seguro" \
+      6 "NVIDIA / pantalla negra" \
+      7 "Volver a una versión anterior de Fedora" \
+      8 "Pruebas de hardware (RAM, disco, VRAM, CPU)" \
+      9 "Discos y espacio" \
+      0 "Contraseñas, SELinux, copia de archivos, terminal" \
+      I "Actualizar o reinstalar Fedora Kinoite" \
+      R "Reiniciar el equipo" \
+      B "Reiniciar en la BIOS / configuración UEFI" \
+      A "Apagar el equipo" 3>&1 1>&2 2>&3) || continue
+    case $c in
+      1) clear; auto_repair ;;
+      2) menu_internet ;;
+      3) menu_bluetooth ;;
+      4) menu_boot ;;
+      5) menu_safe ;;
+      6) menu_nvidia ;;
+      7) FIXES=(); detect && rollback_menu ;;
+      8) menu_hardware ;;
+      9) menu_disks ;;
+      0) menu_system ;;
+      I) menu_reinstall ;;
+      R) release_all; systemctl reboot ;;
+      B) release_all; ensure_efivars; systemctl reboot --firmware-setup || msg "Este equipo no permite entrar a la BIOS desde aquí. Reinicia y pulsa F10 (HP) o Esc." ;;
+      A) release_all; systemctl poweroff ;;
+    esac
+  done
+}
+
+case "${1:-}" in
+  auto) RESCATE_YES=1 auto_repair ;;
+  reinstalar-completo) shift; RESCATE_YES=1 reinstall_full "$@" ;;
+  reinstalar) RESCATE_YES=1 reinstall_keep "${2:-no}" ;;
+  *) main_menu ;;
+esac
