@@ -118,4 +118,4 @@ if [ $LIMPIAR = 1 ]; then
   efibootmgr | sed -n '1,/^Boot[0-9A-F]\{4\}/p;/^Boot[0-9A-F]\{4\}/p' | sort -u | grep -E '^Boot' | sed 's/^/  /'
 fi
 
-say "Listo. Al encender verás el menú de GRUB 5 segundos con la opción 'Rescate — reparar Fedora'."
+say "Listo. Al encender verás el menú de GRUB 5 segundos con la opción 'Rescate - reparar Fedora'."
